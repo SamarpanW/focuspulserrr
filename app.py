@@ -6,9 +6,15 @@ from groq import Groq
 
 app = Flask(__name__)
 
-# Automatic IAM authentication inside Cloud Run
-db = firestore.Client()
-groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
+# Safe lazy initialization helpers to prevent startup crash
+def get_db():
+    return firestore.Client()
+
+def get_groq():
+    api_key = os.environ.get("GROQ_API_KEY", "")
+    if not api_key:
+        raise ValueError("GROQ_API_KEY environment variable is not set in Cloud Run.")
+    return Groq(api_key=api_key)
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -60,22 +66,28 @@ HTML_TEMPLATE = """
 
     <script>
         async function fetchLogs() {
-            const res = await fetch('/api/logs');
-            const data = await res.json();
-            const tbody = document.getElementById('logsTable');
-            tbody.innerHTML = '';
-            
-            data.forEach(log => {
-                const tr = document.createElement('tr');
-                tr.className = 'hover:bg-slate-700/30';
-                tr.innerHTML = `
-                    <td class="p-3 font-semibold text-indigo-400">${log.category || 'DEEP_WORK'}</td>
-                    <td class="p-3 text-slate-300">${log.raw_message}</td>
-                    <td class="p-3 text-center text-emerald-400 font-mono">${log.focus_minutes}m</td>
-                    <td class="p-3 text-center text-rose-400 font-mono">${log.distraction_minutes}m</td>
-                `;
-                tbody.appendChild(tr);
-            });
+            try {
+                const res = await fetch('/api/logs');
+                const data = await res.json();
+                const tbody = document.getElementById('logsTable');
+                tbody.innerHTML = '';
+                
+                if (Array.isArray(data)) {
+                    data.forEach(log => {
+                        const tr = document.createElement('tr');
+                        tr.className = 'hover:bg-slate-700/30';
+                        tr.innerHTML = `
+                            <td class="p-3 font-semibold text-indigo-400">${log.category || 'DEEP_WORK'}</td>
+                            <td class="p-3 text-slate-300">${log.raw_message}</td>
+                            <td class="p-3 text-center text-emerald-400 font-mono">${log.focus_minutes}m</td>
+                            <td class="p-3 text-center text-rose-400 font-mono">${log.distraction_minutes}m</td>
+                        `;
+                        tbody.appendChild(tr);
+                    });
+                }
+            } catch (err) {
+                console.error("Failed to fetch logs:", err);
+            }
         }
 
         document.getElementById('logForm').addEventListener('submit', async (e) => {
@@ -85,16 +97,20 @@ HTML_TEMPLATE = """
             btn.disabled = true;
             btn.innerText = 'Processing with AI...';
 
-            await fetch('/api/log', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ text: text })
-            });
-
-            document.getElementById('rawText').value = '';
-            btn.disabled = false;
-            btn.innerText = 'Analyze & Log via Groq AI';
-            fetchLogs();
+            try {
+                await fetch('/api/log', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ text: text })
+                });
+                document.getElementById('rawText').value = '';
+                fetchLogs();
+            } catch (err) {
+                alert("Error processing log: " + err);
+            } finally {
+                btn.disabled = false;
+                btn.innerText = 'Analyze & Log via Groq AI';
+            }
         });
 
         fetchLogs();
@@ -109,48 +125,47 @@ def home():
 
 @app.route('/api/log', methods=['POST'])
 def create_log():
-    data = request.json or {}
-    raw_text = data.get("text", "")
-    if not raw_text:
-        return jsonify({"error": "No input text provided"}), 400
+    try:
+        data = request.json or {}
+        raw_text = data.get("text", "")
+        if not raw_text:
+            return jsonify({"error": "No input text provided"}), 400
 
-    completion = groq_client.chat.completions.create(
-        model="llama3-8b-8192",
-        response_format={"type": "json_object"},
-        messages=[{
-            "role": "system",
-            "content": """Analyze raw log. Return JSON strictly with keys:
-            category: one of ['DEEP_WORK', 'SHALLOW_WORK', 'LEISURE', 'PROCRASTINATION', 'PHYSICAL'],
-            focus_minutes: int,
-            distraction_minutes: int"""
-        }, {"role": "user", "content": raw_text}]
-    )
+        groq_client = get_groq()
+        completion = groq_client.chat.completions.create(
+            model="llama3-8b-8192",
+            response_format={"type": "json_object"},
+            messages=[{
+                "role": "system",
+                "content": """Analyze raw log. Return JSON strictly with keys:
+                category: one of ['DEEP_WORK', 'SHALLOW_WORK', 'LEISURE', 'PROCRASTINATION', 'PHYSICAL'],
+                focus_minutes: int,
+                distraction_minutes: int"""
+            }, {"role": "user", "content": raw_text}]
+        )
 
-    parsed = json.loads(completion.choices[0].message.content)
-    
-    record = {
-        "raw_message": raw_text,
-        "category": parsed.get("category", "DEEP_WORK"),
-        "focus_minutes": int(parsed.get("focus_minutes", 0)),
-        "distraction_minutes": int(parsed.get("distraction_minutes", 0)),
-        "timestamp": firestore.SERVER_TIMESTAMP
-    }
+        parsed = json.loads(completion.choices[0].message.content)
+        
+        record = {
+            "raw_message": raw_text,
+            "category": parsed.get("category", "DEEP_WORK"),
+            "focus_minutes": int(parsed.get("focus_minutes", 0)),
+            "distraction_minutes": int(parsed.get("distraction_minutes", 0)),
+            "timestamp": firestore.SERVER_TIMESTAMP
+        }
 
-    db.collection("focus_logs").add(record)
-    return jsonify({"status": "success", "data": record}), 200
+        db = get_db()
+        db.collection("focus_logs").add(record)
+        return jsonify({"status": "success", "data": record}), 200
+    except Exception as e:
+        print(f"Error handling /api/log: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/logs', methods=['GET'])
 def get_logs():
-    docs = db.collection("focus_logs").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(20).stream()
-    logs = []
-    for doc in docs:
-        d = doc.to_dict()
-        d['id'] = doc.id
-        if d.get('timestamp'):
-            d['timestamp'] = str(d['timestamp'])
-        logs.append(d)
-    return jsonify(logs), 200
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    try:
+        db = get_db()
+        docs = db.collection("focus_logs").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(20).stream()
+        logs = []
+        for doc in docs:
+            d = doc.to
